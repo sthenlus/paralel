@@ -1,50 +1,38 @@
 #!/usr/bin/env python3
+"""
+MPI ile C = A @ B — basit MPI_Scatter / MPI_Gather (mpi4py: scatter / gather).
+Her surece esit satir: N % P == 0 olmalidir (ornek N=16, P=1,2,4,8,16; varsayilan a.txt / b.txt).
+Kullanim: mpirun -np P python3 main.py [a.txt] [b.txt]
+"""
 from __future__ import annotations
 
-import os
-
-# NumPy altinda OpenBLAS/MKL cok cekirdek acarsa: P=1 zaten tum core'u kullanir,
-# P>1'de her MPI sureci yine cok thread = cekirdek asimi ve olumsuz olceklenme.
-# Her surec 1 matematik thread; P ~ fiziksel cekirdek iken hizlanma gorulur, P=16'da oversubscription.
-for _k in (
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OMP_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-):
-    os.environ.setdefault(_k, "1")
-
 import sys
-from pathlib import Path
+import time
 
-import numpy as np
 from mpi4py import MPI
 
 
-def read_matrix_file(path: Path) -> tuple[int, np.ndarray]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Dosya bulunamadi: {path}")
-    data = path.read_text(encoding="utf-8").split()
-    if not data:
-        raise ValueError(f"Bos dosya: {path}")
-    n = int(data[0])
-    vals = np.asarray(list(map(float, data[1 : 1 + n * n])), dtype=np.float64)
-    if vals.size != n * n:
-        raise ValueError(
-            f"{path}: beklenen {n*n} eleman, okunan {vals.size} (N={n})"
-        )
-    return n, vals.reshape(n, n)
-
-
-def matmul_repeat_count(n: int) -> int:
-    raw = os.environ.get("MPI_MATMUL_REPS")
-    if raw is not None and raw.strip() != "":
-        return max(1, int(raw))
-    if n <= 48:
-        return 1
-    vol = n * n * n
-    r = int(2_000_000_000 // max(vol, 1))
-    return max(30, min(180, r))
+def read_matrix(filename: str) -> tuple[int, list[float]]:
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if not lines:
+            raise ValueError("bos dosya")
+        n = int(lines[0].strip())
+        matrix: list[float] = []
+        for line in lines[1:]:
+            matrix.extend(float(x) for x in line.split())
+        if len(matrix) != n * n:
+            raise ValueError(
+                f"{filename}: beklenen {n * n} eleman, okunan {len(matrix)} (N={n})"
+            )
+        return n, matrix
+    except FileNotFoundError:
+        print(f"Hata: {filename} dosyasi bulunamadi!")
+        MPI.COMM_WORLD.Abort(1)
+    except (ValueError, IndexError) as e:
+        print(f"Hata: {filename} okunamadi: {e}")
+        MPI.COMM_WORLD.Abort(1)
 
 
 def main() -> None:
@@ -52,67 +40,54 @@ def main() -> None:
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    path_a = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("a.txt")
-    path_b = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("b.txt")
+    path_a = sys.argv[1] if len(sys.argv) > 1 else "a.txt"
+    path_b = sys.argv[2] if len(sys.argv) > 2 else "b.txt"
 
     n = None
-    a_full = None
-    b_full = None
+    a = None
+    b = None
 
     if rank == 0:
-        na, a_full = read_matrix_file(path_a)
-        nb, b_full = read_matrix_file(path_b)
+        na, a = read_matrix(path_a)
+        nb, b = read_matrix(path_b)
         if na != nb:
-            raise ValueError(f"A ve B boyutlari esit degil: {na} vs {nb}")
+            print(f"Hata: A ve B boyutlari esit degil ({na} vs {nb}).")
+            comm.Abort(1)
         n = na
+        if n % size != 0:
+            print(
+                f"Hata: MPI_Scatter icin N={n} sayisi P={size} ile tam bolunmeli (N % P == 0)."
+            )
+            comm.Abort(1)
+        start_time = time.perf_counter()
+    else:
+        a = None
+        b = None
 
     n = comm.bcast(n, root=0)
+    b = comm.bcast(b, root=0)
 
-    base = n // size
-    rem = n % size
-    row_counts = np.array([base + (1 if r < rem else 0) for r in range(size)], dtype=np.int32)
-    local_rows = int(row_counts[rank])
-    sendcounts = (row_counts * n).astype(np.int32)
-    displs = np.zeros(size, dtype=np.int32)
-    for r in range(1, size):
-        displs[r] = displs[r - 1] + int(sendcounts[r - 1])
+    rows_per_proc = n // size
+    chunk = rows_per_proc * n
+    chunks = (
+        [a[i * chunk : (i + 1) * chunk] for i in range(size)] if rank == 0 else None
+    )
+    sub_a = comm.scatter(chunks, root=0)
 
-    local_a = np.empty(local_rows * n, dtype=np.float64)
-    b_local = np.empty((n, n), dtype=np.float64)
+    sub_c = [0.0] * chunk
+    for i in range(rows_per_proc):
+        for j in range(n):
+            s = 0.0
+            for k in range(n):
+                s += sub_a[i * n + k] * b[k * n + j]
+            sub_c[i * n + j] = s
 
-    comm.Barrier()
-    t0 = MPI.Wtime()
-
-    a_flat = np.ascontiguousarray(a_full).ravel() if rank == 0 else None
-    if rank == 0:
-        comm.Scatterv([a_flat, sendcounts, displs, MPI.DOUBLE], local_a, root=0)
-    else:
-        comm.Scatterv(None, local_a, root=0)
+    res = comm.gather(sub_c, root=0)
 
     if rank == 0:
-        b_local[:, :] = b_full
-    comm.Bcast(b_local, root=0)
-
-    la = local_a.reshape(local_rows, n)
-    reps = matmul_repeat_count(n)
-    local_c = np.empty((local_rows, n), dtype=np.float64)
-    for _ in range(reps):
-        np.matmul(la, b_local, out=local_c)
-
-    c_full = np.empty(n * n, dtype=np.float64) if rank == 0 else None
-    lc = np.ascontiguousarray(local_c).ravel()
-    if rank == 0:
-        comm.Gatherv(lc, [c_full, sendcounts, displs, MPI.DOUBLE], root=0)
-    else:
-        comm.Gatherv(lc, None, root=0)
-
-    comm.Barrier()
-    t_end = MPI.Wtime()
-
-    if rank == 0:
-        elapsed = t_end - t0
-        print(f"C MPI (Python): N={n}, P={size}, T_P={elapsed:.6f} s")
-        sys.stdout.flush()
+        end_time = time.perf_counter()
+        elapsed = end_time - start_time
+        print(f"Python - N={n}, Proc={size}, Sure={elapsed:.6f} s")
 
 
 if __name__ == "__main__":

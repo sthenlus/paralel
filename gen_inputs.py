@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ornek matris dosyalarini uretir (tekrarlanabilir, dosyadan okuma formati)."""
+"""Ornek: python3 gen_inputs.py --n 16 -> a.txt b.txt; --n 256 --prefix 256 -> a256.txt"""
 from __future__ import annotations
 
 import argparse
@@ -17,9 +17,9 @@ def write_matrix_txt(path: Path, mat: np.ndarray) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="a.txt / b.txt veya N boyutunda ornek uret")
-    p.add_argument("--n", type=int, default=256, help="Matris boyutu (kare)")
-    p.add_argument("--prefix", default="", help="Dosya: a{prefix}.txt (bos: a.txt)")
+    p = argparse.ArgumentParser()
+    p.add_argument("--n", type=int, default=256, help="Matris boyutu")
+    p.add_argument("--prefix", default="", help="a{prefix}.txt (ornek: 8 -> a8.txt)")
     args = p.parse_args()
     n = args.n
     rng = np.random.default_rng(4016)

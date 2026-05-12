@@ -1,8 +1,7 @@
 /*
- * MPI parallel square matrix multiplication C = A * B
- * Rank 0 reads a.txt / b.txt, scatters A rows, broadcasts B, gathers C.
- * Usage: mpirun -np P ./main [path_a] [path_b]
- * Defaults: a.txt b.txt
+ * MPI parallel C = A * B — MPI_Scatter + MPI_Bcast + MPI_Gather (esit satir).
+ * Kosul: N % P == 0 (ornek N=16, P=1,2,4,8,16; varsayilan a.txt / b.txt).
+ * Usage: mpirun -np P ./main [a.txt] [b.txt]
  */
 #include <mpi.h>
 #include <stdio.h>
@@ -24,13 +23,13 @@ static int read_matrix_file(const char *path, int *out_n, double **out_data) {
     size_t total = (size_t)n * (size_t)n;
     double *buf = (double *)malloc(total * sizeof(double));
     if (!buf) {
+        fprintf(stderr, "Hata: '%s' icin bellek yetersiz (N=%d).\n", path, n);
         fclose(f);
         return -1;
     }
     for (size_t i = 0; i < total; i++) {
         if (fscanf(f, "%lf", &buf[i]) != 1) {
-            fprintf(stderr, "Hata: '%s' matris elemani eksik veya gecersiz (beklenen %zu sayi).\n",
-                    path, total);
+            fprintf(stderr, "Hata: '%s' matris elemani eksik.\n", path);
             free(buf);
             fclose(f);
             return -1;
@@ -69,9 +68,8 @@ int main(int argc, char **argv) {
     double *b_full = NULL;
 
     if (rank == 0) {
-        if (read_matrix_file(path_a, &n, &a_full) != 0) {
+        if (read_matrix_file(path_a, &n, &a_full) != 0)
             MPI_Abort(MPI_COMM_WORLD, 1);
-        }
         int nb;
         double *b_tmp = NULL;
         if (read_matrix_file(path_b, &nb, &b_tmp) != 0) {
@@ -85,38 +83,21 @@ int main(int argc, char **argv) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         b_full = b_tmp;
+        if (n % size != 0) {
+            fprintf(stderr,
+                    "Hata: MPI_Scatter icin N=%d, P=%d — N %% P == 0 olmali.\n", n, size);
+            free(a_full);
+            free(b_full);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 
     MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    int *sendcounts = (int *)malloc((size_t)size * sizeof(int));
-    int *displs = (int *)malloc((size_t)size * sizeof(int));
-    int *row_counts = (int *)malloc((size_t)size * sizeof(int));
-    if (!sendcounts || !displs || !row_counts) {
-        if (rank == 0) {
-            free(a_full);
-            free(b_full);
-        }
-        free(sendcounts);
-        free(displs);
-        free(row_counts);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    int base = n / size;
-    int rem = n % size;
-    int offset_rows = 0;
-    for (int r = 0; r < size; r++) {
-        row_counts[r] = base + (r < rem ? 1 : 0);
-        sendcounts[r] = row_counts[r] * n;
-        displs[r] = offset_rows * n;
-        offset_rows += row_counts[r];
-    }
-
-    int local_rows = row_counts[rank];
-    size_t local_el = (size_t)local_rows * (size_t)n;
-    double *local_a = (double *)malloc(local_el * sizeof(double));
-    double *local_c = (double *)malloc(local_el * sizeof(double));
+    int local_rows = n / size;
+    int chunk = local_rows * n;
+    double *local_a = (double *)malloc((size_t)chunk * sizeof(double));
+    double *local_c = (double *)malloc((size_t)chunk * sizeof(double));
     double *b_local = (double *)malloc((size_t)n * (size_t)n * sizeof(double));
 
     if (!local_a || !local_c || !b_local) {
@@ -127,17 +108,13 @@ int main(int argc, char **argv) {
         free(local_a);
         free(local_c);
         free(b_local);
-        free(sendcounts);
-        free(displs);
-        free(row_counts);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
 
-    MPI_Scatterv(a_full, sendcounts, displs, MPI_DOUBLE, local_a, (int)local_el, MPI_DOUBLE, 0,
-                 MPI_COMM_WORLD);
+    MPI_Scatter(a_full, chunk, MPI_DOUBLE, local_a, chunk, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0)
         memcpy(b_local, b_full, (size_t)n * (size_t)n * sizeof(double));
@@ -149,15 +126,13 @@ int main(int argc, char **argv) {
     if (rank == 0)
         c_full = (double *)malloc((size_t)n * (size_t)n * sizeof(double));
 
-    MPI_Gatherv(local_c, (int)local_el, MPI_DOUBLE, c_full, sendcounts, displs, MPI_DOUBLE, 0,
-                MPI_COMM_WORLD);
+    MPI_Gather(local_c, chunk, MPI_DOUBLE, c_full, chunk, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
 
     if (rank == 0) {
-        double elapsed = t1 - t0;
-        printf("C MPI (C): N=%d, P=%d, T_P=%.6f s\n", n, size, elapsed);
+        printf("C MPI (C): N=%d, P=%d, T_P=%.6f s\n", n, size, t1 - t0);
         fflush(stdout);
         free(a_full);
         free(b_full);
@@ -167,9 +142,6 @@ int main(int argc, char **argv) {
     free(local_a);
     free(local_c);
     free(b_local);
-    free(sendcounts);
-    free(displs);
-    free(row_counts);
 
     MPI_Finalize();
     return 0;
