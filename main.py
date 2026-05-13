@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MPI ile C = A @ B — basit MPI_Scatter / MPI_Gather (mpi4py: scatter / gather).
-Her surece esit satir: N % P == 0 olmalidir (ornek N=16, P=1,2,4,8,16; varsayilan a.txt / b.txt).
+MPI ile C = A @ B — MPI_Scatterv / MPI_Gatherv (mpi4py: scatterv / gatherv).
+Her surece degisken satir sayisi: N % P == 0 olmak zorunda degil!
 Kullanim: mpirun -np P python3 main.py [a.txt] [b.txt]
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import time
 
+import numpy as np
 from mpi4py import MPI
 
 
@@ -50,15 +51,12 @@ def main() -> None:
     if rank == 0:
         na, a = read_matrix(path_a)
         nb, b = read_matrix(path_b)
+        a = np.array(a, dtype=np.float64)
+        b = np.array(b, dtype=np.float64)
         if na != nb:
             print(f"Hata: A ve B boyutlari esit degil ({na} vs {nb}).")
             comm.Abort(1)
         n = na
-        if n % size != 0:
-            print(
-                f"Hata: MPI_Scatter icin N={n} sayisi P={size} ile tam bolunmeli (N % P == 0)."
-            )
-            comm.Abort(1)
         start_time = time.perf_counter()
     else:
         a = None
@@ -67,14 +65,33 @@ def main() -> None:
     n = comm.bcast(n, root=0)
     b = comm.bcast(b, root=0)
 
-    rows_per_proc = n // size
-    chunk = rows_per_proc * n
-    chunks = (
-        [a[i * chunk : (i + 1) * chunk] for i in range(size)] if rank == 0 else None
-    )
-    sub_a = comm.scatter(chunks, root=0)
+    # Scatterv icin: her surece degisken satir sayisi ver
+    if rank == 0:
+        base_rows = n // size
+        extra_rows = n % size
+        sendcounts = []
+        displacements = []
+        disp = 0
+        for p in range(size):
+            rows = base_rows + (1 if p < extra_rows else 0)
+            count = rows * n
+            sendcounts.append(count)
+            displacements.append(disp)
+            disp += count
+    else:
+        sendcounts = None
+        displacements = None
+    
+    sendcounts = comm.bcast(sendcounts, root=0)
+    
+    local_chunk = sendcounts[rank]
+    sub_a = np.empty(local_chunk, dtype=np.float64)
+    
+    # Scatterv - NumPy array ile
+    comm.Scatterv([a, (sendcounts, displacements)], sub_a, root=0)
 
-    sub_c = [0.0] * chunk
+    rows_per_proc = local_chunk // n
+    sub_c = np.zeros(local_chunk, dtype=np.float64)
     for i in range(rows_per_proc):
         for j in range(n):
             s = 0.0
@@ -82,7 +99,12 @@ def main() -> None:
                 s += sub_a[i * n + k] * b[k * n + j]
             sub_c[i * n + j] = s
 
-    res = comm.gather(sub_c, root=0)
+    # Gatherv - NumPy array ile
+    c_full = None
+    if rank == 0:
+        c_full = np.empty(n * n, dtype=np.float64)
+    
+    comm.Gatherv(sub_c, [c_full, (sendcounts, displacements)], root=0)
 
     if rank == 0:
         end_time = time.perf_counter()

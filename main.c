@@ -1,6 +1,6 @@
 /*
- * MPI parallel C = A * B — MPI_Scatter + MPI_Bcast + MPI_Gather (esit satir).
- * Kosul: N % P == 0 (ornek N=16, P=1,2,4,8,16; varsayilan a.txt / b.txt).
+ * MPI parallel C = A * B — MPI_Scatterv + MPI_Bcast + MPI_Gatherv (degisken satir).
+ * Kosul: N % P == 0 olmak zorunda degil! Her surece farkli satir sayisi verilebilir.
  * Usage: mpirun -np P ./main [a.txt] [b.txt]
  */
 #include <mpi.h>
@@ -83,28 +83,58 @@ int main(int argc, char **argv) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         b_full = b_tmp;
-        if (n % size != 0) {
-            fprintf(stderr,
-                    "Hata: MPI_Scatter icin N=%d, P=%d — N %% P == 0 olmali.\n", n, size);
-            free(a_full);
-            free(b_full);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
     }
 
     MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    int local_rows = n / size;
-    int chunk = local_rows * n;
-    double *local_a = (double *)malloc((size_t)chunk * sizeof(double));
-    double *local_c = (double *)malloc((size_t)chunk * sizeof(double));
+    // Scatterv icin: her surece degisken satir sayisi ver
+    int *sendcounts = (int *)malloc((size_t)size * sizeof(int));
+    int *displacements = (int *)malloc((size_t)size * sizeof(int));
+    
+    if (!sendcounts || !displacements) {
+        if (rank == 0) {
+            free(a_full);
+            free(b_full);
+        }
+        free(sendcounts);
+        free(displacements);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    
+    if (rank == 0) {
+        int base_rows = n / size;
+        int extra_rows = n % size;
+        displacements[0] = 0;
+        
+        for (int p = 0; p < size; p++) {
+            int rows = base_rows + (p >= size - extra_rows ? 1 : 0);
+            sendcounts[p] = rows * n;
+            if (p > 0)
+                displacements[p] = displacements[p - 1] + sendcounts[p - 1];
+        }
+    }
+    
+    MPI_Bcast(sendcounts, size, MPI_INT, 0, MPI_COMM_WORLD);
+
+   
+
+
+
+
+    int local_chunk = sendcounts[rank];
+    int local_rows = local_chunk / n;
+
+    double *local_a = (double *)malloc((size_t)local_chunk * sizeof(double));
+    double *local_c = (double *)malloc((size_t)local_chunk * sizeof(double));
     double *b_local = (double *)malloc((size_t)n * (size_t)n * sizeof(double));
 
     if (!local_a || !local_c || !b_local) {
         if (rank == 0) {
             free(a_full);
             free(b_full);
+            free(displacements);
         }
+        free(sendcounts);
         free(local_a);
         free(local_c);
         free(b_local);
@@ -114,7 +144,8 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
 
-    MPI_Scatter(a_full, chunk, MPI_DOUBLE, local_a, chunk, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Scatterv(a_full, sendcounts, displacements, MPI_DOUBLE, 
+                 local_a, local_chunk, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0)
         memcpy(b_local, b_full, (size_t)n * (size_t)n * sizeof(double));
@@ -126,7 +157,8 @@ int main(int argc, char **argv) {
     if (rank == 0)
         c_full = (double *)malloc((size_t)n * (size_t)n * sizeof(double));
 
-    MPI_Gather(local_c, chunk, MPI_DOUBLE, c_full, chunk, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_c, local_chunk, MPI_DOUBLE, 
+                 c_full, sendcounts, displacements, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
@@ -137,6 +169,11 @@ int main(int argc, char **argv) {
         free(a_full);
         free(b_full);
         free(c_full);
+        free(sendcounts);
+        free(displacements);
+    } else {
+        free(sendcounts);
+        free(displacements);
     }
 
     free(local_a);
